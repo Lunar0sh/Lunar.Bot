@@ -13,6 +13,9 @@ import logging
 import sys
 import subprocess
 import asyncio
+import random
+import re
+import html
 from urllib.parse import urlparse
 from PIL import Image
 from dotenv import load_dotenv
@@ -56,17 +59,13 @@ class APODBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Bind global error handler
         self.tree.on_error = self.on_app_command_error
-
         await self.tree.sync(guild=DEV_GUILD)
         await self.tree.sync()
         logger.info("Global commands synced. Multi-Guild logic active & duplicates resolved.")
-
         daily_apod_task.start()
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        """Catches errors, e.g., if someone without permissions uses /status."""
         if isinstance(error, app_commands.CheckFailure):
             error_msg = str(error)
             try:
@@ -90,7 +89,6 @@ def load_json(filename):
     try:
         with open(filename, "r") as f:
             data = json.load(f)
-            # Migration/Structure-Check for Multi-Server
             if "channels" not in data:
                 data = {"channels": {}}
             return data
@@ -106,6 +104,14 @@ def save_json(filename, data):
 def get_daily_color():
     day_index = datetime.date.today().toordinal() % len(SPACE_COLORS)
     return SPACE_COLORS[day_index]
+
+
+def get_random_date_str():
+    min_date = datetime.date(1995, 6, 16)
+    max_date = datetime.date.today()
+    random_days = random.randint(0, (max_date - min_date).days)
+    random_date = min_date + datetime.timedelta(days=random_days)
+    return random_date.strftime("%Y-%m-%d")
 
 
 def cleanup_old_cache():
@@ -164,8 +170,7 @@ def compress_media(filepath: str, ext: str) -> str | None:
                 logger.info(f"Compression successful. New size: {new_size / (1024 * 1024):.2f} MB")
                 return compressed_path
             else:
-                logger.warning(
-                    f"Compression failed to reach target. Resulting size is still {new_size / (1024 * 1024):.2f} MB.")
+                logger.warning(f"Compression failed to reach target. Resulting size is still {new_size / (1024 * 1024):.2f} MB.")
                 os.remove(compressed_path)
                 return None
         else:
@@ -187,7 +192,7 @@ async def safe_send(interaction: discord.Interaction = None, channel: discord.Te
             await channel.send(**kwargs)
     except discord.errors.Forbidden as e:
         logger.error(f"403 Forbidden: Missing permissions for channel {channel.id if channel else 'Unknown'}.")
-        raise e  # Bubble up to the daily task for cleanup
+        raise e  
     except discord.errors.HTTPException as e:
         if e.status == 413:
             logger.warning("Discord Server Limit reached (413). Switching to fallback URL.")
@@ -203,7 +208,7 @@ async def safe_send(interaction: discord.Interaction = None, channel: discord.Te
 
 
 async def download_media(url: str, date_str: str) -> str | None:
-    if "youtube.com" in url or "youtu.be" in url or "vimeo.com" in url: return None
+    if not url or "youtube.com" in url or "youtu.be" in url or "vimeo.com" in url: return None
     parsed_url = urlparse(url)
     ext = os.path.splitext(parsed_url.path)[1]
     if not ext: ext = ".jpg"
@@ -291,8 +296,11 @@ async def fetch_apod_with_cache(params=None):
                 async with session.get(url, params=request_params) as response:
                     if response.status == 200:
                         data = await response.json()
+                        
+                        data_dict = data[0] if isinstance(data, list) and len(data) > 0 else data
+
                         if is_standard_call:
-                            image_url = data.get("url", "")
+                            image_url = data_dict.get("hdurl", data_dict.get("url", ""))
                             url_hash = hashlib.md5(image_url.encode()).hexdigest()
                             save_json(CACHE_FILE, {
                                 "date": datetime.date.today().isoformat(),
@@ -330,10 +338,37 @@ async def build_apod_message(data):
     if isinstance(data, list): data = data[0]
 
     title = data.get("title", "Astronomy Picture of the Day")
-    desc = data.get("explanation", "No description available.")
-    media_type = data.get("media_type")
-    url = data.get("url")
-    hdurl = data.get("hdurl")
+    raw_desc = data.get("explanation", "")
+    
+    if not raw_desc:
+        desc = ""
+    else:
+        # Convert HTML line breaks to discord newlines before stripping other tags
+        raw_desc = re.sub(r'<(br|p)\s*/?>', '\n\n', raw_desc, flags=re.IGNORECASE)
+        clean_desc = re.sub(r'<[^>]+>', '', raw_desc)
+        desc = html.unescape(clean_desc).strip()
+        
+        # Strip out the NASA promo footers usually attached to explanations
+        desc = re.sub(r'Your Sky Surprise:.*', '', desc, flags=re.IGNORECASE)
+        desc = re.sub(r'Tomorrow\'s picture:.*', '', desc, flags=re.IGNORECASE)
+        desc = desc.strip()
+        
+    # Intercept broken payload states explicitly with a polished fallback
+    if not desc or "NASA Science" in title:
+        title = "APOD Currently Unavailable"
+        desc = (
+            "NASA's API is currently undergoing a backend migration and failed to return "
+            "valid data for this date.\n\n"
+            "You can still view today's Astronomy Picture of the Day directly on their official site:\n"
+            "🔗 **[science.nasa.gov/apod](https://science.nasa.gov/apod/)**"
+        )
+        media_type = "error"
+        url = "https://science.nasa.gov/apod/"
+        hdurl = None
+
+    media_type = media_type if media_type else data.get("media_type")
+    url = url if url else data.get("url")
+    hdurl = hdurl if hdurl else data.get("hdurl")
     date = data.get("date", "Unknown Date")
 
     if len(desc) > 4000: desc = desc[:3997] + "..."
@@ -342,15 +377,19 @@ async def build_apod_message(data):
     embed.set_author(name="NASA API | APOD", icon_url=NASA_LOGO_URL)
     embed.set_footer(text=f"Date: {date} | Bot by Lun4r.sh")
 
-    local_filepath = await download_media(url, date)
+    download_url = hdurl if media_type == "image" and hdurl else url
+    local_filepath = None
+
+    if media_type != "error":
+        local_filepath = await download_media(download_url, date)
+        
     if local_filepath and media_type == "image":
         embed.set_image(url=f"attachment://{os.path.basename(local_filepath)}")
     elif not local_filepath and media_type == "image":
         logger.info("Serving APOD via direct URL links.")
-        embed.set_image(url=url)
+        embed.set_image(url=download_url)
 
-    # Return raw data to allow fresh View and File generation for multi-channel support
-    return embed, local_filepath, url, media_type, hdurl
+    return embed, local_filepath, url, media_type, download_url
 
 
 # --- Custom Checks ---
@@ -360,7 +399,6 @@ def is_owner():
         if interaction.user.id != OWNER_ID: raise app_commands.CheckFailure(
             "You do not have permission to use this command.")
         return True
-
     return app_commands.check(predicate)
 
 
@@ -414,9 +452,11 @@ async def random_apod(interaction: discord.Interaction):
 
     is_ephemeral = interaction.guild is not None and interaction.channel_id != apod_channel
     await interaction.response.defer(ephemeral=is_ephemeral)
-    logger.info(f"Command /random executed by {interaction.user.name} (Ephemeral: {is_ephemeral})")
+    
+    date_str = get_random_date_str()
+    logger.info(f"Command /random executed by {interaction.user.name} (Ephemeral: {is_ephemeral}) for date {date_str}")
 
-    data = await fetch_apod_with_cache(params={"count": 1})
+    data = await fetch_apod_with_cache(params={"date": date_str})
     if not data:
         await interaction.followup.send("Failed to fetch random APOD.", ephemeral=is_ephemeral)
         return
@@ -436,6 +476,45 @@ async def random_apod(interaction: discord.Interaction):
         await safe_send(interaction=interaction, original_url=original_url, **video_kwargs)
     else:
         kwargs = {"embed": embed, "view": view, "ephemeral": is_ephemeral}
+        if file: kwargs["file"] = file
+        await safe_send(interaction=interaction, original_url=original_url, **kwargs)
+
+
+@bot.tree.command(name="fallback", description="Grabs a random APOD from the archives when today's is unavailable.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def fallback_apod(interaction: discord.Interaction):
+    config = load_json(CONFIG_FILE)
+    channels = config.get("channels", {})
+    guild_id_str = str(interaction.guild_id) if interaction.guild else None
+    apod_channel = channels.get(guild_id_str)
+
+    is_ephemeral = interaction.guild is not None and interaction.channel_id != apod_channel
+    await interaction.response.defer(ephemeral=is_ephemeral)
+    
+    date_str = get_random_date_str()
+    logger.info(f"Command /fallback executed by {interaction.user.name} (Ephemeral: {is_ephemeral}) for date {date_str}")
+
+    data = await fetch_apod_with_cache(params={"date": date_str})
+    if not data:
+        await interaction.followup.send("Failed to fetch fallback APOD.", ephemeral=is_ephemeral)
+        return
+
+    embed, local_filepath, original_url, media_type, hdurl = await build_apod_message(data)
+    view = APODView(hdurl=hdurl) if media_type == "image" else APODView(video_url=original_url)
+    file = discord.File(local_filepath, filename=os.path.basename(local_filepath)) if local_filepath else None
+
+    if media_type == "video":
+        await safe_send(interaction=interaction, embed=embed, view=view, ephemeral=is_ephemeral)
+        video_kwargs = {"ephemeral": is_ephemeral}
+        content = "**Today's APOD is currently unavailable. Here is a fallback video from the archives:**"
+        if not file: content += f"\n{original_url}"
+        video_kwargs["content"] = content
+        if file: video_kwargs["file"] = file
+        await safe_send(interaction=interaction, original_url=original_url, **video_kwargs)
+    else:
+        kwargs = {"embed": embed, "view": view, "ephemeral": is_ephemeral}
+        kwargs["content"] = "**Today's APOD is currently unavailable. Here is a fallback from the archives:**"
         if file: kwargs["file"] = file
         await safe_send(interaction=interaction, original_url=original_url, **kwargs)
 
@@ -588,7 +667,6 @@ async def daily_apod_task():
             channels_to_remove.append(guild_id_str)
             continue
 
-        # Generates a fresh File and View object per channel iteration to avoid discord.py consuming closed files
         view = APODView(hdurl=hdurl) if media_type == "image" else APODView(video_url=original_url)
         file = discord.File(local_filepath, filename=os.path.basename(local_filepath)) if local_filepath else None
 
@@ -604,7 +682,6 @@ async def daily_apod_task():
                 await safe_send(channel=channel, original_url=original_url, **kwargs)
 
             success_count += 1
-            # 0.5s buffer to manage Discord's strict rate limits if serving many guilds
             await asyncio.sleep(0.5)
             
         except discord.errors.Forbidden:
@@ -613,7 +690,6 @@ async def daily_apod_task():
         except Exception as e:
             logger.error(f"Failed to send to channel {channel_id}: {e}")
 
-    # Clean up the config file if any channels were inaccessible 
     if channels_to_remove:
         for gid in channels_to_remove:
             channels.pop(gid, None)
