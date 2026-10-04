@@ -185,12 +185,14 @@ async def safe_send(interaction: discord.Interaction = None, channel: discord.Te
         elif channel:
             kwargs.pop('ephemeral', None)
             await channel.send(**kwargs)
+    except discord.errors.Forbidden as e:
+        logger.error(f"403 Forbidden: Missing permissions for channel {channel.id if channel else 'Unknown'}.")
+        raise e  # Bubble up to the daily task for cleanup
     except discord.errors.HTTPException as e:
         if e.status == 413:
             logger.warning("Discord Server Limit reached (413). Switching to fallback URL.")
             if "file" in kwargs: del kwargs["file"]
-            kwargs[
-                "content"] = f"**Today's APOD is a file that is still too large for Discord even after compression!**\nHere is the direct link: {original_url}"
+            kwargs["content"] = f"**Today's APOD is a file that is still too large for Discord even after compression!**\nHere is the direct link: {original_url}"
             if interaction:
                 await interaction.followup.send(**kwargs)
             elif channel:
@@ -279,21 +281,40 @@ async def fetch_apod_with_cache(params=None):
     request_params['api_key'] = NASA_API_KEY
 
     logger.info("Fetching fresh APOD JSON data from NASA API...")
+    
+    max_retries = 3
+    base_delay = 2
+    
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=request_params) as response:
-            if response.status == 200:
-                data = await response.json()
-                if is_standard_call:
-                    image_url = data.get("url", "")
-                    url_hash = hashlib.md5(image_url.encode()).hexdigest()
-                    save_json(CACHE_FILE, {
-                        "date": datetime.date.today().isoformat(),
-                        "url_hash": url_hash,
-                        "data": data
-                    })
-                return data
-            logger.error(f"NASA API returned status {response.status}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, params=request_params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if is_standard_call:
+                            image_url = data.get("url", "")
+                            url_hash = hashlib.md5(image_url.encode()).hexdigest()
+                            save_json(CACHE_FILE, {
+                                "date": datetime.date.today().isoformat(),
+                                "url_hash": url_hash,
+                                "data": data
+                            })
+                        return data
+                    elif response.status in [500, 502, 503, 504]:
+                        logger.warning(f"NASA API returned {response.status}. Attempt {attempt + 1}/{max_retries} failed.")
+                    else:
+                        logger.error(f"NASA API returned fatal status {response.status}")
+                        return None
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error communicating with NASA API: {e}. Attempt {attempt + 1}/{max_retries} failed.")
+            
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+                
+        logger.error("Failed to fetch APOD data after multiple retries.")
+        return None
 
 
 class APODView(discord.ui.View):
@@ -319,7 +340,7 @@ async def build_apod_message(data):
 
     embed = discord.Embed(title=title, description=desc, color=get_daily_color())
     embed.set_author(name="NASA API | APOD", icon_url=NASA_LOGO_URL)
-    embed.set_footer(text=f"Date: {date} | Bot By Lunar_sh")
+    embed.set_footer(text=f"Date: {date} | Bot by Lun4r.sh")
 
     local_filepath = await download_media(url, date)
     if local_filepath and media_type == "image":
@@ -512,7 +533,7 @@ async def bot_status(interaction: discord.Interaction):
     embed.add_field(name="Local Cache Size", value=f"`{cache_size / (1024 * 1024):.2f} MB`", inline=True)
     embed.add_field(name="Configured Servers", value=f"`{len(channels)}`", inline=True)
 
-    embed.set_footer(text="Diagnostics | Bot By Lunar_sh")
+    embed.set_footer(text="Diagnostics | Bot by Lun4r.sh")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -559,10 +580,13 @@ async def daily_apod_task():
 
     embed, local_filepath, original_url, media_type, hdurl = await build_apod_message(data)
     success_count = 0
+    channels_to_remove = []
 
-    for guild_id_str, channel_id in channels.items():
+    for guild_id_str, channel_id in list(channels.items()):
         channel = bot.get_channel(channel_id)
-        if not channel: continue
+        if not channel: 
+            channels_to_remove.append(guild_id_str)
+            continue
 
         # Generates a fresh File and View object per channel iteration to avoid discord.py consuming closed files
         view = APODView(hdurl=hdurl) if media_type == "image" else APODView(video_url=original_url)
@@ -582,10 +606,22 @@ async def daily_apod_task():
             success_count += 1
             # 0.5s buffer to manage Discord's strict rate limits if serving many guilds
             await asyncio.sleep(0.5)
+            
+        except discord.errors.Forbidden:
+            logger.warning(f"Removing guild {guild_id_str} from config due to missing permissions.")
+            channels_to_remove.append(guild_id_str)
         except Exception as e:
             logger.error(f"Failed to send to channel {channel_id}: {e}")
 
-    logger.info(f"Daily APOD processing finished. Sent to {success_count}/{len(channels)} channels.")
+    # Clean up the config file if any channels were inaccessible 
+    if channels_to_remove:
+        for gid in channels_to_remove:
+            channels.pop(gid, None)
+        config["channels"] = channels
+        save_json(CONFIG_FILE, config)
+        logger.info(f"Removed {len(channels_to_remove)} inaccessible channels from config.")
+
+    logger.info(f"Daily APOD processing finished. Sent to {success_count}/{len(channels) + len(channels_to_remove)} channels.")
 
 
 @bot.event
